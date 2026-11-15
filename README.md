@@ -4,13 +4,23 @@
 
 A three-in-one panel for the Mac notch: **volume** (left) ｜ **notes** (middle) ｜ **screenshots** (right). On a MacBook with a notch the panel unfolds from the notch; on displays without one it is a small capsule you can drag around.
 
-![Noted panel](docs/images/panel.png)
+![Noted panel (macOS style)](assets/1-main-panel-mac.png)
+
+Two looks, switchable in Settings → Appearance: native macOS, or a sci-fi blue HUD.
+
+![Noted panel (sci-fi blue HUD)](assets/1-main-panel-hud.png)
 
 - **Notes** – quick notes and tasks, kept in one local JSON file. Export to Markdown, daily backups.
 - **Screenshots** – based on [ShotLine](https://github.com/olilllioli287/ShotLine) (MIT). New screenshots hang on the right side of the panel: click to mark up, double-click to trash, long-press to copy, drag them into other apps. Hung screenshots are put away automatically after 10 minutes.
 - **Volume** – based on [FineTune](https://github.com/ronitsingh10/FineTune) (GPL-3.0). Per-app volume, EQ and output routing, plus single-choice output device switching, per-device remembered volume, and "no sound from unselected outputs". Calling apps (Discord, Zoom, Teams, …) are left alone so joining a call does not crackle.
 
-![Noted settings](docs/images/settings.png)
+Right after you take a screenshot, it pops out under the notch:
+
+![New screenshots pop out under the notch](assets/2-screenshot-peek-mac.png)
+
+![Noted settings](assets/3-settings-hud.png)
+
+![Noted settings (macOS style)](assets/3-settings-mac.png)
 
 ## Requirements
 
@@ -44,7 +54,7 @@ While the standalone ShotLine or FineTune is running, the matching column in Not
 
 ## Testing
 
-A test build (`./build.sh --dev`) uses its own bundle id and temporary folders. Environment variables such as `NOTED_DATA_DIR`, `NOTED_SHOT_TEST_DIR`, `NOTED_AUDIO_DRYRUN`, `NOTED_TEST_OFFSCREEN` and the `debug.sh` command channel only work in a build whose bundle id ends in `.suite-dev`; the normal build ignores them.
+A test build (`./build.sh --dev`) uses its own bundle id and temporary folders. Environment variables such as `NOTED_DATA_DIR`, `NOTED_SHOT_TEST_DIR`, `NOTED_AUDIO_DRYRUN`, `NOTED_TEST_OFFSCREEN`, `NOTED_DEMO_AUDIO` (fake devices in the volume column, for promo screenshots) and the `debug.sh` command channel only work in a build whose bundle id ends in `.suite-dev`; the normal build ignores them.
 
 ```bash
 open -g -n "build/Noted Dev.app" --env NOTED_DATA_DIR=/tmp/x/data --env NOTED_SHOT_TEST_DIR=/tmp/x/shots \
@@ -75,6 +85,20 @@ The UI is in Traditional Chinese; screenshot strings also have an English table 
 - **筆記**：快速記事與任務，存成一個本機 JSON 檔，可匯出 Markdown，每天自動備份。
 - **截圖**：改自 [ShotLine](https://github.com/olilllioli287/ShotLine)（MIT）。新截圖掛在面板右側：單擊 Markup、雙擊丟垃圾桶、長按拷貝、拖出去給別的 App。掛著的截圖 10 分鐘後自動收起。
 - **音量**：改自 [FineTune](https://github.com/ronitsingh10/FineTune)（GPL-3.0）。每個 App 各自的音量、EQ、輸出路由，加上輸出裝置單選切換、各裝置各自記住音量、沒選到的輸出裝置不外放。通話類 App（Discord、Zoom、Teams 等）不經過 Noted，進語音不會爆音。
+
+![面板（macOS 風格）](assets/1-main-panel-mac.png)
+
+兩種外觀，在「設定 → 外觀」切換：macOS 原生，或科幻藍 HUD。
+
+![面板（科幻藍 HUD）](assets/1-main-panel-hud.png)
+
+剛截完圖，縮圖會從瀏海下方冒出來：
+
+![新截圖從瀏海下方冒出](assets/2-screenshot-peek-mac.png)
+
+![設定視窗（科幻藍 HUD）](assets/3-settings-hud.png)
+
+![設定視窗（macOS 風格）](assets/3-settings-mac.png)
 
 ## 系統需求
 
@@ -108,7 +132,7 @@ swift test                  # 單元測試
 
 ## 測試
 
-測試版（`./build.sh --dev`）用自己的 bundle id 和暫存資料夾。`NOTED_DATA_DIR`、`NOTED_SHOT_TEST_DIR`、`NOTED_AUDIO_DRYRUN`、`NOTED_TEST_OFFSCREEN` 這些環境變數和 `debug.sh` 指令通道，只在 bundle id 結尾是 `.suite-dev` 的版本才有作用，一般版本一律忽略。
+測試版（`./build.sh --dev`）用自己的 bundle id 和暫存資料夾。`NOTED_DATA_DIR`、`NOTED_SHOT_TEST_DIR`、`NOTED_AUDIO_DRYRUN`、`NOTED_TEST_OFFSCREEN`、`NOTED_DEMO_AUDIO`（音量欄改顯示假裝置，拍宣傳圖用）這些環境變數和 `debug.sh` 指令通道，只在 bundle id 結尾是 `.suite-dev` 的版本才有作用，一般版本一律忽略。
 
 ## 授權與來源
 

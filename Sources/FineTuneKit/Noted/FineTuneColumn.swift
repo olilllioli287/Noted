@@ -22,6 +22,9 @@ public struct FineTuneColumn: View {
 
     public var body: some View {
         Group {
+            if Self.demoMode {
+                DemoColumnBody(fg: fg, accent: accent, hud: hud)
+            } else {
             switch module.state {
             case .running:
                 if let engine = module.engine, let monitor = engine.deviceVolumeMonitor as? DeviceVolumeMonitor {
@@ -33,9 +36,17 @@ public struct FineTuneColumn: View {
             case .off:
                 notice("音量功能已關閉", "可以在設定裡打開。")
             }
+            }
         }
         .environment(\.colorScheme, isLight ? .light : .dark)
     }
+
+    /// 宣傳截圖用：只有測試版（bundle id 以 .suite-dev 結尾）加 NOTED_DEMO_AUDIO=1 才會用假的裝置與 App 清單，
+    /// 不碰任何真實裝置與設定。正式版與別人自建的版本一律忽略。
+    static let demoMode: Bool = {
+        Bundle.main.bundleIdentifier?.hasSuffix(".suite-dev") == true
+            && ProcessInfo.processInfo.environment["NOTED_DEMO_AUDIO"] == "1"
+    }()
 
     private func notice(_ title: String, _ detail: String) -> some View {
         VStack(spacing: 6) {
@@ -372,5 +383,93 @@ private struct MiniSlider: View {
                 onChange(Double(min(max(g.location.x / w, 0), 1)))
             })
         }
+    }
+}
+
+
+/// 宣傳截圖用的假音量欄（見 `FineTuneColumn.demoMode`）：假裝置、假 App，滑桿可以拖但不會改任何東西。
+private struct DemoColumnBody: View {
+    let fg: Color
+    let accent: Color
+    let hud: Bool
+
+    private struct Dev: Identifiable { let id: String; let name: String; let symbol: String; var on: Bool; var volume: Double }
+    private struct DemoApp: Identifiable { let id: String; let name: String; let bundleID: String; let symbol: String; var volume: Double; var muted = false }
+
+    @State private var devices = [
+        Dev(id: "a", name: "AirPods Pro", symbol: "airpods.pro", on: true, volume: 0.62),
+        Dev(id: "b", name: "MacBook Pro Speakers", symbol: "laptopcomputer", on: false, volume: 0.45),
+        Dev(id: "c", name: "Studio Display", symbol: "display", on: false, volume: 0.30),
+    ]
+    @State private var apps = [
+        DemoApp(id: "m", name: "Music", bundleID: "com.apple.Music", symbol: "music.note", volume: 0.70),
+        DemoApp(id: "s", name: "Safari", bundleID: "com.apple.Safari", symbol: "safari", volume: 0.45),
+        DemoApp(id: "d", name: "Discord", bundleID: "com.hnc.Discord", symbol: "bubble.left.fill", volume: 1.00),
+        DemoApp(id: "p", name: "Podcasts", bundleID: "com.apple.podcasts", symbol: "mic.fill", volume: 0.30, muted: true),
+    ]
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 3) {
+                header("輸出")
+                ForEach($devices) { $d in
+                    HStack(spacing: 6) {
+                        Button {
+                            for i in devices.indices { devices[i].on = (devices[i].id == d.id) }
+                        } label: {
+                            OutputToggleBadge(icon: nil, symbol: d.symbol, state: d.on ? .on : .off, fg: fg, hudAccent: hud ? accent : nil)
+                        }.buttonStyle(.plain)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(d.name).font(.system(size: 11.5, weight: d.on ? .semibold : .regular)).lineLimit(1)
+                            MiniSlider(value: d.volume, tint: d.on ? accent : fg.opacity(0.4), track: fg.opacity(0.14), diamond: hud) { d.volume = $0 }
+                                .frame(height: 12)
+                        }
+                        Text("\(Int((d.volume * 100).rounded()))%").font(.system(size: 10.5, design: .rounded)).monospacedDigit()
+                            .opacity(0.65).frame(width: 34, alignment: .trailing)
+                        Image(systemName: "speaker.wave.2.fill").font(.system(size: 10.5)).foregroundStyle(fg.opacity(0.6))
+                            .frame(width: 20, height: 22)
+                    }
+                    .padding(.horizontal, 4).padding(.vertical, 2)
+                    .background(
+                        Group {
+                            if hud {
+                                HUDChamfer(cut: 6).fill(accent.opacity(d.on ? 0.1 : 0))
+                                    .overlay(HUDChamfer(cut: 6).stroke(accent.opacity(d.on ? 0.45 : 0), lineWidth: 1))
+                            } else {
+                                RoundedRectangle(cornerRadius: 7, style: .continuous).fill(fg.opacity(d.on ? 0.07 : 0))
+                            }
+                        })
+                    .opacity(d.on ? 1 : 0.55)
+                }
+                header("App").padding(.top, 6)
+                ForEach($apps) { $a in
+                    HStack(spacing: 6) {
+                        Group {
+                            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: a.bundleID) {
+                                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable().scaledToFit()
+                            } else {
+                                Image(systemName: a.symbol).resizable().scaledToFit().padding(2)
+                            }
+                        }.frame(width: 18, height: 18)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(a.name).font(.system(size: 11.5)).lineLimit(1)
+                            MiniSlider(value: a.volume, tint: accent, track: fg.opacity(0.14), diamond: hud) { a.volume = $0 }.frame(height: 12)
+                        }
+                        Text("\(Int((a.volume * 100).rounded()))%").font(.system(size: 10.5, design: .rounded)).monospacedDigit()
+                            .opacity(0.65).frame(width: 34, alignment: .trailing)
+                        Image(systemName: a.muted ? "speaker.slash.fill" : "speaker.wave.2.fill").font(.system(size: 10.5))
+                            .foregroundStyle(a.muted ? Color.red.opacity(0.85) : fg.opacity(0.6)).frame(width: 20, height: 22)
+                    }
+                    .padding(.horizontal, 4).padding(.vertical, 2)
+                }
+            }
+            .padding(.horizontal, 6).padding(.bottom, 8)
+        }
+        .foregroundStyle(fg)
+    }
+
+    private func header(_ title: String) -> some View {
+        HStack { Text(title).font(.system(size: 10.5, weight: .semibold)).opacity(0.45); Spacer(minLength: 0) }
+            .padding(.horizontal, 4).frame(height: 18)
     }
 }
