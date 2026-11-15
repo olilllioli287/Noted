@@ -1,0 +1,44 @@
+Noted
+Copyright (C) 2026 olilllioli287
+
+Noted is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License version 3, as published by the Free
+Software Foundation. The full text is in the file LICENSE.
+
+Noted is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+This product includes software from other projects:
+
+1. FineTune
+   Source:    https://github.com/ronitsingh10/FineTune
+   Used in:   Sources/FineTuneKit/ (full license text: Sources/FineTuneKit/LICENSE)
+   License:   GNU General Public License v3.0
+   Copyright: (C) 2026 Ronit Singh
+   Upstream version used: 2285279 (v1.9.0)
+
+   MODIFICATION NOTICE (GPL-3.0 section 5(a)): this project modified FineTune
+   in November 2026. The changes include: packaging it as a library
+   (FineTuneKit) embedded in the Noted app; the files under
+   Sources/FineTuneKit/Noted/ (output selection policy, call-app exclusion,
+   mute release, output alignment); user-interface strings translated to
+   Traditional Chinese; and edits marked "// Noted:" in the source.
+
+2. ShotLine
+   Source:    https://github.com/olilllioli287/ShotLine (fork of the original
+              project by Alejandro Buján)
+   Used in:   Sources/ShotLineKit/, Resources/ShotLine/
+              (full license text: Sources/ShotLineKit/LICENSE)
+   License:   MIT
+   Copyright: (c) 2026 Alejandro Buján
+   Upstream version used: 8e02c31
+
+3. KeyboardShortcuts (Swift package dependency, not copied into this repository)
+   Source:    https://github.com/sindresorhus/KeyboardShortcuts
+   License:   MIT
+   Copyright: (c) Sindre Sorhus
+   Version:   2.4.0
+
+The MIT-licensed code is compatible with, and is distributed here under the
+terms of, the GNU General Public License v3.0 as part of the combined work.

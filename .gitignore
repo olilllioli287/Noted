@@ -1,0 +1,9 @@
+/Noted
+*.o
+.DS_Store
+.build/
+/build/
+.swiftpm/
+
+# 測試截圖可能拍到使用者的筆記，不進版控
+screenshots/
