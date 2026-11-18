@@ -53,6 +53,10 @@ final class Line: ObservableObject {
     /// Card frames in window coordinates, reported by the views. The panel
     /// uses them to only catch clicks over photos and let the rest through.
     var hitRects: [UUID: CGRect] = [:]
+    /// Noted: 新截圖提示與右欄各自回報的卡片位置（視窗座標，左上角為原點），飛行落點用。
+    /// 刻意不是 @Published：只在要起飛時讀一次，平常不會讓畫面多重畫。
+    var peekRects: [UUID: CGRect] = [:]
+    var columnRects: [UUID: CGRect] = [:]
 
     var maxItems = 8
     /// How many photos fit across the screen. With Keep on line set, the
@@ -424,6 +428,13 @@ final class Line: ObservableObject {
         items[i].managed = true
         items[i].modified = modificationDate(target)
         save()
+    }
+
+    /// 啟動時收件匣裡多出來、掛不下的舊檔：直接收進截圖資料夾，不掛上、不解縮圖。
+    /// 掛過的、正等丟垃圾桶的、已經掛著的不碰。
+    func shelveOrphan(_ url: URL) {
+        guard !Line.isPendingTrash(url), !wasHung(url), !items.contains(where: { $0.url == url }) else { return }
+        _ = moveToKeepFolder(url)
     }
 
     private func moveToKeepFolder(_ url: URL) -> URL? {

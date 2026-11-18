@@ -49,6 +49,8 @@ enum Inbox {
     /// off those settings are back in macOS, and captures still on the line
     /// follow them there.
     static var keepFolder: URL {
+        // 使用者自己選的資料夾優先；資料夾不見了或不能寫就當沒設，退回下面的預設規則（收下不能失敗）
+        if let custom = customKeepFolder { return custom }
         if let test = ShotLineModule.testDirectory { return test.appendingPathComponent("kept", isDirectory: true) }
         let saved = UserDefaults.standard.dictionary(forKey: savedKey)
         let candidates: [String?] = saved.map { [$0["locationScreenshot"] as? String, $0["location"] as? String] }
@@ -59,6 +61,53 @@ enum Inbox {
             if url.standardizedFileURL != folder.standardizedFileURL { return url }
         }
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
+    }
+
+    // MARK: 使用者自選的收好位置（Noted）
+
+    /// 存使用者選的資料夾路徑。刻意不放進 `inboxSavedSettings`：那份是關掉收件匣時要還給 macOS 的原設定。
+    private static let keepOverrideKey = "inboxKeepFolderOverride"
+
+    /// 使用者自選的路徑（不管現在還能不能用）。沒選過是 nil。
+    static var customKeepPath: String? {
+        let path = UserDefaults.standard.string(forKey: keepOverrideKey)
+        return (path?.isEmpty == false) ? path : nil
+    }
+
+    /// 自選的資料夾現在能不能用：存在、是資料夾、可寫，而且不是收件匣自己（或收件匣裡面）。
+    static func usableKeepFolder(_ url: URL, inbox inboxFolder: URL = Inbox.folder) -> Bool {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue,
+              FileManager.default.isWritableFile(atPath: url.path) else { return false }
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let inbox = inboxFolder.resolvingSymlinksInPath().standardizedFileURL.path
+        return path != inbox && !path.hasPrefix(inbox + "/")
+    }
+
+    /// 自選的資料夾，只在現在還能用時回傳；否則 nil（呼叫端退回預設規則）。
+    static var customKeepFolder: URL? {
+        guard let path = customKeepPath else { return nil }
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
+        return usableKeepFolder(url) ? url : nil
+    }
+
+    /// 設定頁的小字：有自選但資料夾不見了或不能寫時回傳那個路徑。
+    static var unusableCustomKeepPath: String? {
+        guard let path = customKeepPath, customKeepFolder == nil else { return nil }
+        return path
+    }
+
+    /// 選好資料夾。不能用就不存、回傳 false（呼叫端提示）。
+    @discardableResult
+    static func setCustomKeepFolder(_ url: URL) -> Bool {
+        guard usableKeepFolder(url) else { return false }
+        UserDefaults.standard.set(url.standardizedFileURL.path, forKey: keepOverrideKey)
+        return true
+    }
+
+    /// 恢復預設（只清自選的那一個鍵，不碰 inboxSavedSettings）。
+    static func resetCustomKeepFolder() {
+        UserDefaults.standard.removeObject(forKey: keepOverrideKey)
     }
 
     /// Captures sent to an app stay in this folder for a while as a second

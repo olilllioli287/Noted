@@ -95,6 +95,7 @@ enum SuiteHost {
                 return app.hasOpenWindows || app.controllers.contains(where: \.isExpanded)
                     || FineTuneModule.shared.isFullPanelVisible
             }
+            shot.releaseHostKeyboard = { AppDelegate.shared.controllers.forEach { $0.releaseKeyboard() } }
             shot.onTogglePanel = { audio.onTogglePanel() }
             shot.onOpenSettings = { AppDelegate.shared.openSettings(pane: .shots) }
             shot.onNewCapture = {
@@ -105,11 +106,32 @@ enum SuiteHost {
                 let target = app.controllers.first { $0.screen.frame.contains(NSEvent.mouseLocation) } ?? app.controllers.first
                 target?.showShot(count: ShotLineModule.shared.peekCount)
             }
-            shot.onSent = {
-                // 截圖拖給別的 App 了：面板收起來（原本是繩子收回去），焦點由 ShotLine 的 FocusReturn 交給那個 App
+            shot.flightContext = { from in
+                // 新截圖從拍攝位置飛到它掛的位置：面板展開就飛到右欄，收起就飛到新截圖提示。
+                // 沒落點（暫停、提示關閉、拍攝位置不在提示出現的那個螢幕）回傳 nil，卡片直接現身。
+                // 飛行每一幀都會再問一次，所以這裡只讀現在的狀態，不留任何東西。
                 let app = AppDelegate.shared!
-                app.controllers.first(where: \.isExpanded)?.collapse(restoreFocus: false)
+                let expandedController = app.controllers.first(where: \.isExpanded)
+                let target = expandedController
+                    ?? app.controllers.first { $0.screen.frame.contains(NSEvent.mouseLocation) } ?? app.controllers.first
+                let mid = CGPoint(x: from.midX, y: from.midY)
+                guard let target, !GamePause.shared.isPaused, expandedController != nil || SuitePrefs.shared.shotPeek,
+                      NSScreen.screens.first(where: { $0.frame.contains(mid) }) == target.screen else { return nil }
+                let expanded = expandedController != nil
+                return ShotLineModule.FlightContext(
+                    windowFrame: target.model.windowFrame, visible: target.model.shapeRect, expanded: expanded,
+                    dark: !expanded || !Prefs.shared.panelIsLight, screen: target.screen)
+            }
+            shot.onSent = {
+                // 截圖拖給別的 App 了：焦點由 ShotLine 的 FocusReturn 交給那個 App。
+                // 展開中的面板不收，讓使用者接著拖下一張；6 秒內（每送出一張重算）不因為滑鼠離開而收起。
+                let app = AppDelegate.shared!
+                app.controllers.first(where: \.isExpanded)?.sentFromPanel()
                 app.controllers.forEach { $0.refreshShot(count: ShotLineModule.shared.peekCount) }
+            }
+            shot.onCountDecreased = {
+                // 任何途徑讓掛著的截圖變少：提示上沒東西就收起，還有就重排
+                AppDelegate.shared?.controllers.forEach { $0.refreshShot(count: ShotLineModule.shared.peekCount) }
             }
             if suite.shotEnabled { shot.start() }
         }

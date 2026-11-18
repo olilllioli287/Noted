@@ -34,7 +34,9 @@ public final class ShotLineModule: ObservableObject {
         return nil
     }()
 
-    public static let standaloneBundleID = "local.shotline.ShotLine"
+    /// 測試版可以用 NOTED_FAKE_STANDALONE_ID 換成一個假的「舊版」bundle id，在暫存環境重現待命接手；正式版忽略。
+    private static let fakeStandaloneID: String? = DevBuild.environment["NOTED_FAKE_STANDALONE_ID"].flatMap { $0.isEmpty ? nil : $0 }
+    public static let standaloneBundleID = fakeStandaloneID ?? "local.shotline.ShotLine"
 
     /// 右欄最多留幾張。再多，最舊的自己退場（檔案不動）。
     public static let columnCapacity = 12
@@ -51,9 +53,14 @@ public final class ShotLineModule: ObservableObject {
     public var onNewCapture: () -> Void = {}
     /// 截圖被拖進別的 App 了。Noted 用它把面板收起來。
     public var onSent: () -> Void = {}
+    /// 掛著的張數變少了（按叉叉、右鍵丟棄／收下、打勾、雙擊、自動收走、裁掉…任何途徑）。
+    /// Noted 用它把提示上已經沒有的截圖收掉或重排。
+    public var onCountDecreased: () -> Void = {}
     /// 瀏海面板展開打字中、或 Noted 自己的視窗開著時回 true，
     /// 這時候不把鍵盤交回上一個 App。
     public var hostBusy: () -> Bool = { false }
+    /// 宿主放掉自己面板握著的鍵盤（拖放給別的 App 時用）
+    public var releaseHostKeyboard: () -> Void = {}
     /// 原本「叫出繩子」的快捷鍵（預設 ⌃ ⌥ T）被按了。Noted 用它展開／收起面板。
     public var onTogglePanel: () -> Void = {}
     private var hotKey: HotKey?
@@ -67,6 +74,9 @@ public final class ShotLineModule: ObservableObject {
     private var remountPending = false
     private var observers: [NSObjectProtocol] = []
     private var standbyObserver: NSObjectProtocol?
+    /// 待命時每 2 秒看一次舊版還在不在。NSWorkspace 的結束通知不會送出背景型（LSUIElement，選單列）App 的結束，
+    /// 舊版 ShotLine 就是這種 App，只靠通知會永遠等不到。
+    private var standbyTimer: Timer?
     private var focusStarted = false
     private var cancellables = Set<AnyCancellable>()
 
@@ -80,15 +90,12 @@ public final class ShotLineModule: ObservableObject {
 
     public func start() {
         guard state != .running else { return }
-        if Self.testDirectory == nil, standaloneRunning {
+        if Self.testDirectory == nil || Self.fakeStandaloneID != nil, standaloneRunning {
             state = .standby
             waitForStandaloneToQuit()
             return
         }
-        if let o = standbyObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(o)
-            standbyObserver = nil
-        }
+        cancelStandbyWait()
         migrateFromStandaloneIfNeeded()
         Line.migrateShotKeep10minIfNeeded()
 
@@ -103,9 +110,11 @@ public final class ShotLineModule: ObservableObject {
         if !focusStarted {
             focusStarted = true
             FocusReturn.shared.hostBusy = { [weak self] in self?.hostBusy() ?? false }
+            FocusReturn.shared.releaseHostKeyboard = { [weak self] in self?.releaseHostKeyboard() }
             FocusReturn.shared.start()
         }
         startWatcher()
+        recoverInboxOrphans()
         observeVolumes()
         watchScreenshotSettings()
         let clipboard = ClipboardWatcher { [weak self] url in self?.hangCapture(url) }
@@ -142,10 +151,41 @@ public final class ShotLineModule: ObservableObject {
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
 
+        line.$items
+            .map { $0.filter { !$0.falling }.count }
+            .removeDuplicates()
+            .scan((0, 0)) { ($0.1, $1) }
+            .filter { $0.1 < $0.0 }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.onCountDecreased() }
+            .store(in: &cancellables)
+
         state = .running
     }
 
+    private func cancelStandbyWait() {
+        if let o = standbyObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(o)
+            standbyObserver = nil
+        }
+        standbyTimer?.invalidate()
+        standbyTimer = nil
+    }
+
     private func waitForStandaloneToQuit() {
+        if standbyTimer == nil {
+            standbyTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    guard self.state == .standby else { self.cancelStandbyWait(); return }
+                    guard !self.standaloneRunning else { return }
+                    // 等它把系統截圖設定還原完再接手
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        if ShotLineModule.shared.state == .standby { ShotLineModule.shared.start() }
+                    }
+                }
+            }
+        }
         guard standbyObserver == nil else { return }
         standbyObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
@@ -163,10 +203,7 @@ public final class ShotLineModule: ObservableObject {
 
     /// 關掉模組（設定裡關掉時）。系統截圖設定還原、監看停掉。
     public func stop() {
-        if let o = standbyObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(o)
-            standbyObserver = nil
-        }
+        cancelStandbyWait()
         guard state == .running else { state = .off; return }
         shutdown()
         watcher?.stop(); watcher = nil
@@ -302,10 +339,139 @@ public final class ShotLineModule: ObservableObject {
         inboxTimer = timer
     }
 
-    private func hangCapture(_ url: URL) {
-        guard let line, line.hang(url) != nil else { return }
-        onNewCapture()
+    /// 上次不正常結束（當掉、被強制結束、斷電）時，系統截圖位置還指著收件匣，那段時間拍的截圖
+    /// 會留在裡面沒人管；監看器的第一次列表又把啟動前就在的檔案都當舊的。
+    /// 啟動時把收件匣裡的圖都掛上（hang 本身會略過已掛著、掛過、正等丟垃圾桶的）。
+    private func recoverInboxOrphans() {
+        // 收件匣模式沒開時，系統截圖位置沒指到這裡，裡面的東西不是這個功能該管的
+        guard Inbox.isEnabled, let line else { return }
+        let media: Set<String> = ["png", "jpg", "jpeg", "heic", "tif", "tiff", "gif", "webp", "mov", "mp4"]
+        let urls = ((try? FileManager.default.contentsOfDirectory(
+            at: Inbox.folder, includingPropertiesForKeys: [.creationDateKey], options: [.skipsHiddenFiles])) ?? [])
+            .filter { media.contains($0.pathExtension.lowercased()) && !Line.isPendingTrash($0) }
+        // 建立時間每個檔案只讀一次（排序比較器裡重讀會是 N log N 次檔案系統呼叫）
+        let dated = urls.map { u in (u, (try? u.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast) }
+        let sorted = dated.sorted { $0.1 < $1.1 }.map(\.0)
+        // 最新的掛到上限為止；更舊的掛不下，直接收進截圖資料夾（不在主執行緒解一堆縮圖）
+        let limit = Self.columnCapacity
+        for url in sorted.dropLast(limit) { line.shelveOrphan(url) }
+        for url in sorted.suffix(limit) {
+            // 掛不上（縮圖解不出來、殘缺的錄影）也不能留在隱藏的收件匣，改收進截圖資料夾
+            if line.hang(url, quietly: true) == nil { line.shelveOrphan(url) }
+        }
     }
+
+    private func hangCapture(_ url: URL) {
+        guard let line else { return }
+        Self.mark("detect")
+        // 檔案一出現就在拍攝位置給回饋（彈一下），不等卡片掛好、也不等新截圖提示長出來；
+        // 有拍攝位置、主程式願意（flightContext 回傳不是 nil）、同時飛的少於 2 張才這樣，其餘直接掉進去。
+        // 卡片在起飛前先藏著（flying），所以每個 id 一定要有人讓它現身（landCapture）。
+        var flight: CaptureFlight?
+        var from: CGRect?
+        if pendingFlights.count < 2, let r = captureRect(of: url), let c = flightContext?(r) {
+            from = r
+            let f = CaptureFlight.begin(from: r, on: c.screen, level: Self.flightLevel, dark: c.dark)
+            flight = f
+            decodeFlightImage(url, for: f, from: r, screen: c.screen)
+        }
+        guard let id = line.hang(url, flying: flight != nil) else {
+            flight?.cancel()   // 掛不上（重複、縮圖解不出來）：彈起的畫面淡掉就好
+            return
+        }
+        onNewCapture()
+        guard let flight, let from else { return }
+        pendingFlights.insert(id)
+        let tilt = line.items.first(where: { $0.id == id })?.tilt ?? 0
+        flight.attach(tag: id, tilt: CGFloat(tilt), target: { [weak self] in self?.flightTarget(id: id, from: from) },
+                      completion: { [weak self] in
+            if DevBuild.isDev { Self.debugAllTo.append("\(id.uuidString.prefix(4)) \(Self.debugLastTo.integral)") }
+            self?.landCapture(id)
+        })
+        // 保險：不管飛行出什麼事，卡片最晚 3 秒後一定現身
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.landCapture(id) }
+    }
+
+    /// 在背景把截圖解成飛行用的大小（整張螢幕的 PNG 解碼要幾十毫秒，不能卡住「立刻回饋」）；解好前飛行先用白底。
+    private func decodeFlightImage(_ url: URL, for flight: CaptureFlight, from: CGRect, screen: NSScreen) {
+        let pixels = min(1500, max(400, Int(max(from.width, from.height) * screen.backingScaleFactor)))
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: pixels,
+            ]
+            guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return }
+            DispatchQueue.main.async { flight.setImage(image) }
+        }
+    }
+
+    /// 卡片現在應該落在哪（螢幕座標）。每一幀問一次；新截圖提示還沒長出來、位置還沒回報、
+    /// 面板暫時看不到這張時回傳 nil，飛行就沿用上一次的落點。
+    private func flightTarget(id: UUID, from: CGRect) -> CGRect? {
+        guard let line, let c = flightContext?(from),
+              line.items.contains(where: { $0.id == id && !$0.falling && !$0.away }),
+              let g = (c.expanded ? line.columnRects : line.peekRects)[id],
+              g.width > 4, g.height > 4, c.windowFrame.width > 0,
+              g.minX >= -1, g.minY >= -1, g.maxX <= c.windowFrame.width + 1, g.maxY <= c.windowFrame.height + 1 else { return nil }
+        let to = CGRect(x: c.windowFrame.minX + g.minX, y: c.windowFrame.maxY - g.maxY, width: g.width, height: g.height)
+        guard c.visible.insetBy(dx: -2, dy: -2).contains(to) else { return nil }
+        if DevBuild.isDev { Self.debugLastTo = to }
+        return to
+    }
+
+    /// 飛行結束（或不飛了）：真的卡片現身。可以重複呼叫。
+    public func landCapture(_ id: UUID) {
+        Self.mark("land")
+        pendingFlights.remove(id)
+        line?.land(id)
+    }
+
+    /// 現在的面板狀態（由主程式回報；飛行每一幀都會重問，因為面板會長出來、收起、展開）。
+    public struct FlightContext {
+        /// 瀏海視窗在螢幕上的位置（卡片位置是相對這個視窗回報的）
+        public var windowFrame: CGRect
+        /// 面板現在可見的範圍（螢幕座標）；落點不在裡面（例如右欄捲走了）就不飛
+        public var visible: CGRect
+        /// 面板是展開的（看右欄的位置），否則看新截圖提示的位置
+        public var expanded: Bool
+        /// 面板是暗色的（卡片玻璃也是暗的）
+        public var dark: Bool
+        public var screen: NSScreen
+        public init(windowFrame: CGRect, visible: CGRect, expanded: Bool, dark: Bool, screen: NSScreen) {
+            self.windowFrame = windowFrame; self.visible = visible; self.expanded = expanded; self.dark = dark; self.screen = screen
+        }
+    }
+
+    /// 測試版的除錯指令用：存下飛行中的畫面、回報殘留的飛行視窗數
+    public static func debugFlightAuto(_ prefix: String) { CaptureFlight.debugAutoSnapshotPrefix = prefix }
+    public static func debugFlightSnapshot(_ path: String) -> Bool { CaptureFlight.debugSnapshot(to: path) }
+    private static var debugLastTo: CGRect = .zero
+    private static var debugAllTo: [String] = []
+    /// 測試用（只有測試版會記）：每個事件的牆上時間（秒），給量「從檔案出現到卡片落地」用
+    private static var debugTimeline: [String] = []
+    static func mark(_ event: String) {
+        guard DevBuild.isDev else { return }
+        debugTimeline.append("\(event)=\(String(format: "%.3f", Date().timeIntervalSince1970))")
+    }
+    /// 測試用：每張起飛時量到的落點，以及現在新截圖提示與右欄各卡片實際的位置（視窗座標）
+    public static func debugFlightDetail() -> String {
+        let line = shared.line
+        let peek = (line?.peekRects ?? [:]).map { "\($0.key.uuidString.prefix(4)) \($0.value.integral)" }.sorted()
+        let column = (line?.columnRects ?? [:]).map { "\($0.key.uuidString.prefix(4)) \($0.value.integral)" }.sorted()
+        return "timeline=\(debugTimeline.joined(separator: " "))\nflights(螢幕座標)=\(debugAllTo)\npeek(視窗座標)=\(peek)\ncolumn(視窗座標)=\(column)"
+    }
+    public static var debugFlightState: String { "to=\(debugLastTo) flying=\(CaptureFlight.debugFlying) visibleWindows=\(CaptureFlight.debugVisibleWindows) hiddenCards=\(shared.line?.items.filter(\.flying).count ?? -1) cards=\(shared.line?.items.count ?? -1)" }
+
+    /// 飛行視窗要蓋在瀏海視窗（選單列 + 3）上面，不然落地時會被面板擋住。
+    private static let flightLevel = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 4)
+
+    /// 正在等著飛、或正在飛的截圖（最多 2 張，其餘直接掉進去）
+    private var pendingFlights = Set<UUID>()
+    /// Noted：新截圖出現時問主程式「現在要不要飛、面板在哪」。回傳 nil（遊戲暫停、提示關閉、拍攝位置不在提示出現的螢幕）就不飛，卡片直接現身。
+    /// 飛行進行中每一幀也會再問一次，回報最新的面板位置。
+    public var flightContext: ((_ from: CGRect) -> FlightContext?)?
 
     // MARK: 設定（Noted 的設定頁與右欄選單用）
 
@@ -358,6 +524,38 @@ public final class ShotLineModule: ObservableObject {
     public var keepFolder: URL { Inbox.keepFolder }
     /// 現在監看的截圖資料夾
     public var watchedFolder: URL? { watcher?.folder }
+
+    /// 使用者有沒有自選收好的位置（只要選過就算，就算資料夾後來不見了）
+    public var hasCustomKeepFolder: Bool { Inbox.customKeepPath != nil }
+    /// 自選的資料夾現在不能用（不見了或不能寫）時的路徑；設定頁用來顯示一行小字
+    public var unusableCustomKeepPath: String? { Inbox.unusableCustomKeepPath }
+
+    /// 設定頁：選收好的截圖要放的資料夾（可新增資料夾）。選到不能用的就擋下並提示，不改設定。
+    public func chooseKeepFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "選擇"
+        panel.message = "收好的截圖會放到這個資料夾。已經收好的舊截圖不會搬過去。"
+        if let start = Inbox.customKeepFolder { panel.directoryURL = start }
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if !Inbox.setCustomKeepFolder(url) {
+            let alert = NSAlert()
+            alert.messageText = "不能用這個資料夾"
+            alert.informativeText = "它不存在、沒有寫入權限，或是 Noted 自己暫存截圖用的資料夾。請選別的資料夾。"
+            alert.runModal()
+        }
+        objectWillChange.send()
+    }
+
+    /// 設定頁：恢復預設（macOS 原本的截圖位置，沒有就桌面）
+    public func resetKeepFolder() {
+        Inbox.resetCustomKeepFolder()
+        objectWillChange.send()
+    }
 
     public func clear() { line?.clear() }
 
@@ -528,6 +726,7 @@ private struct LineWall: View {
                 .frame(width: width, height: geo.size.height)
             }
         }
+        .onPreferenceChange(HitRectsKey.self) { rects in line.columnRects = rects }
     }
 }
 
@@ -594,5 +793,6 @@ private struct PeekRow: View {
             }
         }
         .frame(height: h)
+        .onPreferenceChange(HitRectsKey.self) { rects in line.peekRects = rects }
     }
 }

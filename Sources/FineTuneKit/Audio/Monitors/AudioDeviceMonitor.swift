@@ -291,6 +291,7 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
 
         for deviceID in currentIDs.subtracting(btOutputDeviceIDs) {
             removeSampleRateListener(for: deviceID)
+            logger.notice("[DIAG] 取樣率監聽已移除：裝置 ID \(deviceID)（不再被判斷為藍牙輸出或已消失）")
         }
 
         for deviceID in btOutputDeviceIDs.subtracting(currentIDs) {
@@ -309,6 +310,7 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
             if status == noErr {
                 sampleRateListeners[deviceID] = block
                 lastKnownSampleRates[deviceID] = (try? deviceID.readNominalSampleRate()) ?? 0
+                logger.notice("[DIAG] 取樣率監聽已安裝：\(uid, privacy: .public) 目前 \(Int(self.lastKnownSampleRates[deviceID] ?? 0)) Hz")
             } else {
                 logger.warning("Failed to add sample rate listener for BT device \(deviceID): \(status)")
             }

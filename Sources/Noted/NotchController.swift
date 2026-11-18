@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import ShotLineKit
 
 /// shot＝新截圖提示：瀏海長出一小塊，掛著最新的幾張截圖
 enum NotchState { case collapsed, hover, drop, reminder, shot, expanded }
@@ -41,11 +42,29 @@ struct NavState: Equatable {
     var task: UUID?
 }
 
+/// 展開中從右欄把截圖拖給別的 App 之後的「剛送出寬限」：這段時間面板不因為「滑鼠離開」而收起，
+/// 好讓使用者接著拖下一張。每成功送出一張就把倒數重新設回 `seconds`；滑鼠回到面板裡就提早結束。
+/// 時間由呼叫端傳進來，方便測試。
+struct SendGrace {
+    static let seconds: TimeInterval = 6
+    private(set) var until: Date?
+
+    mutating func sent(at now: Date) { until = now.addingTimeInterval(Self.seconds) }
+    mutating func end() { until = nil }
+    func isActive(at now: Date) -> Bool { until.map { now < $0 } ?? false }
+}
+
 final class NotchPanel: NSPanel {
     var allowKey = false
     var keyHandler: ((NSEvent) -> Bool)?
     override var canBecomeKey: Bool { allowKey }
     override var canBecomeMain: Bool { false }
+    /// 鍵盤放掉之後（拖出給別的 App），使用者點回面板：再拿回 key，多點一下才能打字
+    var onClickWhileIdle: (() -> Void)?
+    override func sendEvent(_ e: NSEvent) {
+        super.sendEvent(e)
+        if e.type == .leftMouseUp, !isKeyWindow { onClickWhileIdle?() }
+    }
     override func keyDown(with e: NSEvent) {
         if keyHandler?(e) == true { return }
         super.keyDown(with: e)
@@ -70,6 +89,15 @@ final class InteractionView: NSView {
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect], owner: self))
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    /// 新截圖提示時只有瀏海那一條接滑鼠（點一下展開面板），底下的截圖卡片自己接拖曳與點擊。
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let c = controller, c.model.state == .shot else { return super.hitTest(point) }
+        // 用視窗的邏輯位置換算成螢幕座標（測試模式視窗會被移到畫面外，不能直接用視窗的實際位置）
+        let wp = (superview ?? self).convert(point, to: nil)   // hitTest 收到的是父視圖座標
+        let wf = c.model.windowFrame
+        let logical = NSPoint(x: wf.minX + wp.x, y: wf.minY + wp.y)
+        return c.shotNotchStrip.contains(logical) ? self : nil
+    }
     // 進出只是通知；真正要不要展開，看游標是不是在形狀裡面
     override func mouseEntered(with e: NSEvent) { if !dragging { controller?.pointerChanged() } }
     override func mouseExited(with e: NSEvent) { if !dragging { controller?.pointerChanged() } }
@@ -92,9 +120,10 @@ final class InteractionView: NSView {
     override func rightMouseDown(with e: NSEvent) { controller?.showContextMenu(e, in: self) }
 
     override func draggingEntered(_ s: NSDraggingInfo) -> NSDragOperation { controller?.dropEntered() ?? [] }
-    override func draggingUpdated(_ s: NSDraggingInfo) -> NSDragOperation { Prefs.shared.textDrop ? .copy : [] }
+    override func draggingUpdated(_ s: NSDraggingInfo) -> NSDragOperation { controller?.model.state == .shot ? [] : (Prefs.shared.textDrop ? .copy : []) }
     override func draggingExited(_ s: NSDraggingInfo?) { controller?.dropExited() }
     override func performDragOperation(_ s: NSDraggingInfo) -> Bool {
+        guard controller?.model.state != .shot else { return false }   // 提示狀態不接文字拖放
         guard let text = s.draggingPasteboard.string(forType: .string) else { return false }
         return controller?.performDrop(text) ?? false
     }
@@ -112,7 +141,14 @@ final class NotchController {
     private var leaveWork: DispatchWorkItem?
     private var monitors: [Any] = []
     private var prevApp: NSRunningApplication?
+    /// 展開前那個 App 的輸入框：點空白收起後，輸入框的游標要還回去
+    private var prevInput: RememberedInput?
     private var mouseWasInside = false   // 展開後滑鼠進過面板，才開始算「移開就收起」
+    private var sendGrace = SendGrace()
+    private var graceWork: DispatchWorkItem?
+    /// 測試用：假裝滑鼠在這裡（只有測試版的除錯指令會設）
+    private var mouseOverride: NSPoint?
+    private var mousePoint: NSPoint { mouseOverride ?? NSEvent.mouseLocation }
     private var hudWork: DispatchWorkItem?
     private var reminderWork: DispatchWorkItem?
     private var shotWork: DispatchWorkItem?
@@ -147,6 +183,21 @@ final class NotchController {
         window.hidesOnDeactivate = false
         window.isReleasedWhenClosed = false
         window.acceptsMouseMovedEvents = true
+        window.onClickWhileIdle = { [weak self] in
+            guard let self, self.model.state == .expanded else { return }
+            // 從別的 App 拿走鍵盤：之後收起時要還給它，輸入框也要重新記
+            if let front = NSWorkspace.shared.frontmostApplication, front != NSRunningApplication.current {
+                self.prevApp = front
+                self.prevInput = nil
+                InputFocus.captureAsync(pid: front.processIdentifier) { [weak self] input in
+                    if let self, self.model.state == .expanded, self.prevApp?.processIdentifier == front.processIdentifier { self.prevInput = input }
+                }
+            }
+            self.window.allowKey = true
+            NSApp.activate(ignoringOtherApps: true)
+            self.window.makeKeyAndOrderFront(nil)
+            self.model.focusToken += 1
+        }
 
         model.controller = self
         let host = NSHostingView(rootView: NotchRootView(m: model))
@@ -275,6 +326,14 @@ final class NotchController {
         s == .shot ? shapeRect(for: .shot).insetBy(dx: -24, dy: -24) : fullFrame()
     }
 
+    /// 新截圖提示最上面、跟瀏海同高的一條（螢幕座標）：點這裡可以展開面板。
+    var shotNotchStrip: CGRect {
+        let r = model.shapeRect
+        // 沒有實體瀏海時提示上方只留 6 點空白（見 size(for: .shot)），不能吃進卡片
+        let h = model.hasNotch ? notchRect.height : min(notchRect.height, 6)
+        return CGRect(x: r.minX, y: r.maxY - h, width: r.width, height: h)
+    }
+
     private func transition(to s: NotchState) {
         // 離開提示：先把視窗放回完整範圍，動畫才有地方畫
         if model.state == .shot, s != .shot { setWindowFrame(fullFrame()) }
@@ -289,8 +348,8 @@ final class NotchController {
             model.state = s
             model.shapeRect = target
         }
-        // 新截圖提示上的照片要自己接滑鼠（拖曳、單擊、雙擊），所以這時也把互動層拿掉
-        interaction.isHidden = (s == .expanded || s == .shot)
+        // 提示時互動層留著，但 hitTest 只讓瀏海那一條接滑鼠
+        interaction.isHidden = (s == .expanded)
         token += 1
         pointerChanged()
     }
@@ -326,6 +385,8 @@ final class NotchController {
 
     func beginDrag() {
         dragStart = notchRect
+        // 提示狀態下開始拖膠囊：提示的計時與游標狀態一起清掉，不然 shotHovering 會卡著
+        if model.state == .shot { shotWork?.cancel(); shotWork = nil; shotHovering = false }
         if model.state != .collapsed {
             model.state = .collapsed
             token += 1
@@ -371,9 +432,18 @@ final class NotchController {
         model.reminder = nil
         model.confirmDelete = false
         if model.state != .expanded {
+            endSendGrace()
             model.suiteTab = 1   // 窄螢幕一次一欄時，打開先看筆記
             mouseWasInside = model.shapeRect.contains(NSEvent.mouseLocation)
-            if let front = NSWorkspace.shared.frontmostApplication, front != NSRunningApplication.current { prevApp = front }
+            prevInput = nil
+            InputFocus.cancelPending()
+            if let front = NSWorkspace.shared.frontmostApplication, front != NSRunningApplication.current {
+                prevApp = front
+                if activate { InputFocus.captureAsync(pid: front.processIdentifier) { [weak self] input in
+                    // 晚到的結果只在還是同一次展開、同一個 App 時才收
+                    if let self, self.model.state == .expanded, self.prevApp?.processIdentifier == front.processIdentifier { self.prevInput = input }
+                } }
+            }
             transition(to: .expanded)
         }
         guard activate else { return }   // 測試用：只展開畫面，不搶鍵盤
@@ -386,6 +456,7 @@ final class NotchController {
 
     func collapse(restoreFocus: Bool = true) {
         leaveWork?.cancel()
+        endSendGrace()
         guard model.state != .collapsed else { return }
         let wasExpanded = model.state == .expanded
         Store.shared.saveNow()
@@ -397,10 +468,19 @@ final class NotchController {
         window.allowKey = false
         window.resignKey()
         ReminderController.shared.reset()
-        if restoreFocus, NSApp.isActive, !AppDelegate.shared.hasOpenWindows {
-            if let p = prevApp, !p.isTerminated { p.activate() } else { NSApp.hide(nil); window.orderFrontRegardless() }
+        // Noted 是作用中、或自己的面板還握著 key 時都要交還（只靠 resignKey 通知，key 不會真的交出去）
+        if restoreFocus, NSApp.isActive || window.isKeyWindow, !AppDelegate.shared.hasOpenWindows {
+            if let p = prevApp, !p.isTerminated { NSApp.yieldActivation(to: p); p.activate() } else { NSApp.hide(nil); window.orderFrontRegardless() }
         }
-        prevApp = nil
+        prevApp = nil; prevInput = nil
+    }
+
+    /// 把自己面板握著的鍵盤放掉（不改前景）：真正交出去靠呼叫端把啟用權讓給對方 App
+    func releaseKeyboard() {
+        prevApp = nil; prevInput = nil   // 鍵盤已交給別的 App，收起時不要再把前景搶回展開前那個
+        window.makeFirstResponder(nil)
+        window.allowKey = false
+        window.resignKey()
     }
 
     func togglePin() { model.pinned.toggle() }
@@ -442,11 +522,26 @@ final class NotchController {
     private func mouseMoved() {
         pointerChanged()
         guard model.state == .expanded, !model.pinned, Prefs.shared.collapseOnLeave else { return }
+        // 剛從面板拖出一張截圖：寬限內不倒數「離開就收起」。滑鼠回到面板裡就提早結束寬限，恢復平常規則
+        if sendGrace.isActive(at: Date()) {
+            if panelHolds(mousePoint) { endSendGrace(); mouseWasInside = true }
+            leaveWork?.cancel(); leaveWork = nil
+            return
+        }
+        scheduleLeaveCheck()
+    }
+
+    /// 游標在面板裡（外加一圈邊）、拖著截圖、或在音量的完整面板上，都算還在面板裡
+    private func panelHolds(_ p: NSPoint) -> Bool {
+        model.shapeRect.insetBy(dx: -28, dy: -28).contains(p) || SuiteHost.keepsPanelOpen(at: p)
+    }
+
+    /// 滑鼠離開面板：0.6 秒後還在外面才收起（進過面板才開始算）
+    private func scheduleLeaveCheck() {
         // 按著滑鼠（拖右下角調大小、拉滑桿拉出面板外）時不算離開
         guard NSEvent.pressedMouseButtons == 0 else { leaveWork?.cancel(); leaveWork = nil; return }
-        let p = NSEvent.mouseLocation
-        // 拖著截圖、或游標在音量的完整面板上，都算還在面板裡
-        if model.shapeRect.insetBy(dx: -28, dy: -28).contains(p) || SuiteHost.keepsPanelOpen(at: p) {
+        let p = mousePoint
+        if panelHolds(p) {
             mouseWasInside = true
             leaveWork?.cancel(); leaveWork = nil
             return
@@ -456,17 +551,57 @@ final class NotchController {
             guard let self else { return }
             self.leaveWork = nil
             if NotchController.menuTracking || NoteTextView.active?.hasMarkedText() == true || self.model.confirmDelete { return }
-            let now = NSEvent.mouseLocation
-            if !self.model.shapeRect.insetBy(dx: -28, dy: -28).contains(now), !SuiteHost.keepsPanelOpen(at: now) { self.collapse() }
+            if self.sendGrace.isActive(at: Date()) { return }
+            if !self.panelHolds(self.mousePoint) { self.collapse() }
         }
         leaveWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: w)
     }
 
+    // MARK: 剛送出寬限
+
+    /// 展開中從右欄拖出一張截圖、對方收下了：面板不收，6 秒內暫停「滑鼠離開就收起」，好讓使用者接著拖下一張。
+    /// 每成功送出一張就重新算 6 秒。點別處照常收起。
+    func sentFromPanel() {
+        guard model.state == .expanded else { return }
+        sendGrace.sent(at: Date())
+        leaveWork?.cancel(); leaveWork = nil
+        graceWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.graceExpired() }
+        graceWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + SendGrace.seconds, execute: w)
+    }
+
+    private func endSendGrace() {
+        sendGrace.end()
+        graceWork?.cancel()
+        graceWork = nil
+    }
+
+    /// 寬限到了：滑鼠還在面板外，就照平常規則 0.6 秒後收起（不是立刻收，也不是永遠不收）
+    private func graceExpired() {
+        graceWork = nil
+        sendGrace.end()
+        guard model.state == .expanded, !model.pinned, Prefs.shared.collapseOnLeave else { return }
+        mouseWasInside = true
+        scheduleLeaveCheck()
+    }
+
+    /// 測試用：把滑鼠假裝在 p（nil＝還原成真的滑鼠），並走一次「滑鼠移動」的流程
+    func debugMouse(_ p: NSPoint?) {
+        mouseOverride = p
+        mouseMoved()
+    }
+
     private func clickedElsewhere() {
         guard model.state == .expanded, !model.pinned, !NotchController.menuTracking else { return }
         let p = NSEvent.mouseLocation
-        if !model.shapeRect.contains(p), !SuiteHost.keepsPanelOpen(at: p) { collapse() }
+        if !model.shapeRect.contains(p), !SuiteHost.keepsPanelOpen(at: p) {
+            let remembered = prevInput
+            collapse()
+            // 這一下點擊會穿過去點到底下的 App，網頁輸入框因此失去游標；收起後等點擊做完，再看一次、必要時還回去
+            if let remembered { InputFocus.schedule(remembered, label: "點空白收起", delays: [0.2, 0.6, 1.2]) }
+        }
     }
 
     // MARK: 新截圖提示
@@ -482,7 +617,25 @@ final class NotchController {
     }
 
     /// 暫停狀態變了：開始暫停就把冒出來的提示收掉，並重設要不要接滑鼠
+    private var pauseRetryPending = false
     func pauseChanged() {
+        // 暫停（遊戲或手動）時展開中的面板也收起，不要蓋在遊戲上；釘選的是他要留著，不動。
+        // 還焦點由 collapse 自己用 NSApp.isActive 把關：遊戲在前景時 Noted 不是作用中，不會搶遊戲的焦點；
+        // 手動暫停時 Noted 是作用中，這時要還給上一個 App。
+        if GamePause.shared.isPaused, model.state == .expanded, !model.pinned {
+            if SuiteHost.shotBusy {
+                // 正在拖截圖（可能是從右欄拖出來）：收掉會把拖曳來源拿走，放開後再收
+                if !pauseRetryPending {
+                    pauseRetryPending = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                        self?.pauseRetryPending = false
+                        self?.pauseChanged()
+                    }
+                }
+            } else {
+                collapse()
+            }
+        }
         if GamePause.shared.isPaused, model.state != .expanded, model.state != .collapsed {
             if model.state == .shot, SuiteHost.shotBusy {
                 // 正在拖提示上的截圖：先不收（收掉會把拖曳來源的畫面拿走），放開後一秒內收
@@ -530,7 +683,7 @@ final class NotchController {
     // MARK: 拖放文字
 
     func dropEntered() -> NSDragOperation {
-        guard Prefs.shared.textDrop, model.state != .expanded, !GamePause.shared.isPaused else { return [] }
+        guard Prefs.shared.textDrop, model.state != .expanded, model.state != .shot, !GamePause.shared.isPaused else { return [] }
         model.dropTitle = Store.shared.current?.title ?? "新任務"
         model.dropDone = false
         transition(to: .drop)

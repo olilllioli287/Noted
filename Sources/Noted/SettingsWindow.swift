@@ -238,6 +238,8 @@ struct AudioSettings: View {
 struct ShotSettings: View {
     @ObservedObject var suite = SuitePrefs.shared
     @ObservedObject var shot = ShotLineModule.shared
+    @State private var accessTrusted = InputFocus.isTrusted
+    private let accessTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
         Section("截圖（ShotLine）") {
@@ -256,6 +258,20 @@ struct ShotSettings: View {
             Text("游標停在提示上不計時，移開後重新算。這跟下面「自動收進截圖資料夾」的時間是分開的。")
                 .font(.caption).foregroundStyle(.secondary)
         }
+        Section("輔助使用") {
+            HStack {
+                Text(accessTrusted ? "輔助使用：已授權" : "輔助使用：未授權")
+                Spacer()
+                if !accessTrusted {
+                    Button("打開系統設定⋯") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(url) }
+                    }
+                }
+            }
+            Text("拖截圖給別的 App、或點空白收起面板後，要把游標放回原本的輸入框，需要這個權限。只會讀取與設定輸入框的焦點，不會模擬點擊或打字，也不會記錄你輸入的內容。")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .onReceive(accessTimer) { _ in accessTrusted = InputFocus.isTrusted }
         if shot.state == .running {
             Section("截圖怎麼處理") {
                 Toggle("接管系統截圖（截完馬上掛上，不經過桌面）", isOn: Binding(get: { shot.inboxEnabled }, set: { shot.inboxEnabled = $0 }))
@@ -293,6 +309,12 @@ struct ShotSettings: View {
                     Text("收好的截圖放在 \((shot.keepFolder.path as NSString).abbreviatingWithTildeInPath)").font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Button("打開") { NSWorkspace.shared.open(shot.keepFolder) }
+                    Button("更改⋯") { shot.chooseKeepFolder() }
+                    if shot.hasCustomKeepFolder { Button("恢復預設") { shot.resetKeepFolder() } }
+                }
+                if let missing = shot.unusableCustomKeepPath {
+                    Text("你選的資料夾 \((missing as NSString).abbreviatingWithTildeInPath) 現在找不到或不能寫入，先放在預設位置。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
         }

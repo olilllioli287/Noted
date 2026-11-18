@@ -153,6 +153,8 @@ final class ProcessTapController: ProcessTapControlling {
     private var alignSubDevices: [UInt32: [String]] = [:]
     /// 最近一次 `buildAggregateDescription` 決定要對齊時的子裝置順序；建好 aggregate 後由 `makeAligner` 取走
     private var pendingAlignSubDevices: [String]?
+    /// 診斷用：這次建 aggregate 的原因（只給 [DIAG] 紀錄用）
+    private var diagReason = "建立或切換裝置"
 
     /// IO 執行緒：這個 IO proc 自己的延遲線
     @inline(__always)
@@ -411,6 +413,33 @@ final class ProcessTapController: ProcessTapControlling {
         )
     }
 
+    /// 診斷用：tap 的格式（取樣率、聲道）跟 aggregate／clock 裝置的取樣率是否一致。只讀。
+    private func logTapFormatDiagnostics(aggregateRate: Float64, clockUID: String?) {
+        let asbd = try? primaryResources.tapID.readAudioTapStreamBasicDescription()
+        let clockRate = clockUID.flatMap { audioDeviceID(for: $0) }.flatMap { try? $0.readNominalSampleRate() }
+        let tapRate = asbd?.mSampleRate
+        let mismatch = (tapRate != nil && tapRate != aggregateRate) || (clockRate != nil && clockRate != aggregateRate)
+        logger.notice("[DIAG] tap 格式：app=\(self.app.name, privacy: .public) tap取樣率=\(tapRate.map { String(Int($0)) } ?? "讀不到", privacy: .public) tap聲道=\(asbd.map { String($0.mChannelsPerFrame) } ?? "?", privacy: .public) aggregate取樣率=\(Int(aggregateRate)) clock裝置取樣率=\(clockRate.map { String(Int($0)) } ?? "?", privacy: .public) 不一致=\(mismatch)")
+    }
+
+    /// 診斷用：每次建 aggregate 都留一筆會落盤的紀錄（notice 等級），
+    /// 供「爆音只有重開才好」時對照：clock device、傳輸類型原始值與是否讀取失敗、最後的 drift compensation。
+    /// 只在建立 aggregate 的事件裡呼叫，絕不放進 IO callback。只讀屬性，不改任何行為。查法：log show --last 1h --predicate 'eventMessage CONTAINS "[DIAG]"'
+    private func logAggregateDiagnostics(plan: AggregatePlan, isPrimaryBTOutput: Bool, tapDriftCompensation: Bool) {
+        let clockID = audioDeviceID(for: plan.clockDeviceUID)
+        var rawText = "裝置找不到"
+        if let clockID {
+            if let raw = try? clockID.read(kAudioDevicePropertyTransportType, defaultValue: UInt32(0)) {
+                rawText = "raw=\(raw) 讀取成功"
+            } else {
+                rawText = "讀取失敗"
+            }
+        }
+        let rateText = clockID.flatMap { try? $0.readNominalSampleRate() }.map { String(Int($0)) } ?? "?"
+        let time = ISO8601DateFormatter().string(from: Date())
+        logger.notice("[DIAG] \(time, privacy: .public) 建立 aggregate：app=\(self.app.name, privacy: .public) 子裝置=\(plan.subDeviceUIDs, privacy: .public) clock=\(plan.clockDeviceUID, privacy: .public) clock取樣率=\(rateText, privacy: .public) 傳輸類型：\(rawText, privacy: .public) isPrimaryBTOutput=\(isPrimaryBTOutput) 來源虛擬=\(self.isTapSourceVirtual()) tapDriftCompensation=\(tapDriftCompensation) 重建原因=\(self.diagReason, privacy: .public)")
+    }
+
     /// Builds aggregate device description for synchronized multi-device output.
     /// First device is clock source (no drift compensation), others sync to it via drift compensation.
     private func buildAggregateDescription(outputUIDs: [String], tapUUID: UUID, name: String) -> [String: Any] {
@@ -453,6 +482,7 @@ final class ProcessTapController: ProcessTapControlling {
         // domains genuinely differ. Defaults OFF on an unresolvable device (less wrong on unknown BT).
         let isPrimaryBTOutput = audioDeviceID(for: plan.clockDeviceUID)?.isBluetoothDevice() ?? true
         let tapDriftCompensation = !isTapSourceVirtual() && !isPrimaryBTOutput
+        logAggregateDiagnostics(plan: plan, isPrimaryBTOutput: isPrimaryBTOutput, tapDriftCompensation: tapDriftCompensation)
 
         return [
             kAudioAggregateDeviceNameKey: name,
@@ -541,6 +571,8 @@ final class ProcessTapController: ProcessTapControlling {
         guard activated, let primaryUID = currentDeviceUIDs.first else { return }
         guard primaryResources.tapDescription != nil else { throw CrossfadeError.noTapDescription }
         logger.info("[RATE] \(self.app.name): recreating aggregate at new rate")
+        diagReason = "取樣率變化重建"
+        defer { diagReason = "建立或切換裝置" }
         try await performDestructiveDeviceSwitch(to: primaryUID, allDeviceUIDs: currentDeviceUIDs, sourceAlreadySilent: true)
     }
 
@@ -750,6 +782,7 @@ final class ProcessTapController: ProcessTapControlling {
             sampleRate = 48000
             logger.warning("Failed to read sample rate, using default: \(sampleRate) Hz")
         }
+        logTapFormatDiagnostics(aggregateRate: sampleRate, clockUID: targetDeviceUIDs.first)
         let rampTimeSeconds: Float = 0.030  // 30ms - fast enough to feel responsive, slow enough to avoid clicks
         rampCoefficient = 1 - exp(-1 / (Float(sampleRate) * rampTimeSeconds))
         logger.debug("Ramp coefficient: \(self.rampCoefficient)")
@@ -1380,6 +1413,7 @@ final class ProcessTapController: ProcessTapControlling {
         currentDeviceUIDs = outputUIDs
 
         if let deviceSampleRate = try? primaryResources.aggregateDeviceID.readNominalSampleRate() {
+            logTapFormatDiagnostics(aggregateRate: deviceSampleRate, clockUID: outputUIDs.first)
             rampCoefficient = 1 - exp(-1 / (Float(deviceSampleRate) * 0.030))
             eqProcessor?.updateSampleRate(deviceSampleRate)
             autoEQProcessor?.updateSampleRate(deviceSampleRate)

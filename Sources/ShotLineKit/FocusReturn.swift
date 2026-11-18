@@ -18,9 +18,12 @@ final class FocusReturn {
         case ignore
     }
 
-    nonisolated static func activationPlan(targetPID: pid_t, frontPID: pid_t?, myPID: pid_t) -> ActivationPlan {
+    /// notedHoldsKeyboard：Noted 仍是作用中、或還有 key 視窗。這時就算 frontmostApplication 已經是目標，
+    /// 鍵盤其實還在 Noted 手上（實測：peek 的 NotchPanel 一直是 key），不能放著不管。
+    nonisolated static func activationPlan(targetPID: pid_t, frontPID: pid_t?, myPID: pid_t,
+                                           notedHoldsKeyboard: Bool = false) -> ActivationPlan {
         guard targetPID != myPID else { return .ignore }
-        return frontPID == targetPID ? .leaveAlone : .bringForward
+        return (frontPID == targetPID && !notedHoldsKeyboard) ? .leaveAlone : .bringForward
     }
 
     static let shared = FocusReturn()
@@ -62,6 +65,8 @@ final class FocusReturn {
 
     /// Noted: 瀏海面板展開打字中、或 Noted 自己的視窗開著時，不把鍵盤交回去。
     var hostBusy: () -> Bool = { false }
+    /// Noted：把自己面板握著的鍵盤放掉（allowKey = false、resignKey），不改前景
+    var releaseHostKeyboard: () -> Void = {}
 
     private func giveBackIfIdle(attempt: Int) {
         guard NSApp.isActive, !hostBusy() else { return }
@@ -84,80 +89,42 @@ final class FocusReturn {
         guard let target = Self.window(at: point) else { return }
         let myPID = ProcessInfo.processInfo.processIdentifier
         let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        let plan = Self.activationPlan(targetPID: target.pid, frontPID: frontPID, myPID: myPID)
+        let notedHolds = NSApp.isActive || NSApp.keyWindow != nil
+        let plan = Self.activationPlan(targetPID: target.pid, frontPID: frontPID, myPID: myPID, notedHoldsKeyboard: notedHolds)
         guard plan != .ignore else { return }
         guard let app = NSRunningApplication(processIdentifier: target.pid), !app.isTerminated else { return }
-        // The app you dropped on is already in front: nothing of ours should
-        // step in, or its text field loses the keyboard. Only point the
-        // keyboard at the field under the drop, when Accessibility allows.
+        // Only the window under the drop is raised, never another window of the same app.
+        if AXIsProcessTrusted() { Self.raiseWindow(target) }
         if plan == .leaveAlone {
-            if AXIsProcessTrusted() { Self.focusTextElement(at: point, pid: target.pid) }
+            // The app you dropped on is already in front and Noted holds nothing:
+            // nothing of ours should step in, or its text field loses the keyboard.
             log.notice("already in front")
-            return
+        } else {
+            // Give up whatever Noted's own panel holds, then hand the keyboard over.
+            releaseHostKeyboard()
+            // Activation is ours to hand over only while we are active, so
+            // ShotLine steps in front for a moment and yields at once.
+            if !NSApp.isActive { NSApp.activate() }
+            NSApp.yieldActivation(to: app)
+            app.activate()
+            log.notice("Brought \(app.bundleIdentifier ?? "?", privacy: .public) forward after a drop (Noted held keyboard: \(notedHolds, privacy: .public))")
         }
-        if AXIsProcessTrusted() {
-            // With Accessibility the exact window comes up, even in an app
-            // with several.
-            let element = AXUIElementCreateApplication(target.pid)
-            var value: CFTypeRef?
-            if AXUIElementCopyAttributeValue(element, kAXWindowsAttribute as CFString, &value) == .success,
-               let windows = value as? [AXUIElement],
-               let window = windows.first(where: { Self.frame(of: $0) == target.frame }) {
-                AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-                AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-            }
-        }
-        // Activation is ours to hand over only while we are active, so
-        // ShotLine steps in front for a moment and yields at once.
-        NSApp.activate()
-        NSApp.yieldActivation(to: app)
-        app.activate()
-        log.notice("Brought \(app.bundleIdentifier ?? "?", privacy: .public) forward after a drop")
-        // The field can only take the keyboard once its app is in front.
-        if AXIsProcessTrusted() {
-            let pid = target.pid
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                MainActor.assumeIsolated { Self.focusTextElement(at: point, pid: pid) }
-            }
+        // Remember the text field and keep checking, after the hand-over: the
+        // field under the drop, else the one the app had last.
+        if let primaryMaxY = NSScreen.screens.first?.frame.maxY {
+            InputFocus.restoreAfterDrop(atTopLeft: CGPoint(x: point.x, y: primaryMaxY - point.y), pid: target.pid)
         }
     }
 
-    /// Focus a text control under the drop point without synthesizing input.
-    /// Only a control of the app that took the drop, only one that is enabled
-    /// and accepts focus: a read-only log next to the input box stays alone.
-    private static func focusTextElement(at point: NSPoint, pid: pid_t) {
-        guard let primaryMaxY = NSScreen.screens.first?.frame.maxY else { return }
-        let x = Float(point.x), y = Float(primaryMaxY - point.y)
-        let systemWide = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(systemWide, 0.3)
-        var found: AXUIElement?
-        guard AXUIElementCopyElementAtPosition(systemWide, x, y, &found) == .success, var element = found else { return }
-        let roles: Set<String> = [kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String, "AXSearchField"]
-        for level in 0...6 {
-            var owner: pid_t = 0
-            guard AXUIElementGetPid(element, &owner) == .success, owner == pid else { return }
-            AXUIElementSetMessagingTimeout(element, 0.3)
-            var roleValue: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleValue) == .success else { return }
-            if let role = roleValue as? String, roles.contains(role) {
-                var settable = DarwinBoolean(false)
-                var enabledValue: CFTypeRef?
-                let enabled = AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &enabledValue) != .success
-                    || (enabledValue as? Bool ?? true)
-                guard enabled,
-                      AXUIElementIsAttributeSettable(element, kAXFocusedAttribute as CFString, &settable) == .success,
-                      settable.boolValue else { return }
-                var focusedValue: CFTypeRef?
-                let alreadyFocused = AXUIElementCopyAttributeValue(element, kAXFocusedAttribute as CFString, &focusedValue) == .success
-                    && (focusedValue as? Bool ?? false)
-                if !alreadyFocused { AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) }
-                return
-            }
-            if level == 6 { return }
-            var parentValue: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parentValue) == .success,
-                  let parentValue, CFGetTypeID(parentValue) == AXUIElementGetTypeID() else { return }
-            element = unsafeDowncast(parentValue as AnyObject, to: AXUIElement.self)
+    /// With Accessibility the exact window under the drop comes up, even in an app with several.
+    private static func raiseWindow(_ target: (pid: pid_t, frame: CGRect)) {
+        let element = AXUIElementCreateApplication(target.pid)
+        var value: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXWindowsAttribute as CFString, &value) == .success,
+           let windows = value as? [AXUIElement],
+           let window = windows.first(where: { frame(of: $0) == target.frame }) {
+            AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         }
     }
 

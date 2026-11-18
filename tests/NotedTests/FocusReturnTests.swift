@@ -17,4 +17,12 @@ struct FocusReturnTests {
     @Test func missingFrontAppBringsTargetForward() {
         #expect(FocusReturn.activationPlan(targetPID: 20, frontPID: nil, myPID: 10) == .bringForward)
     }
+
+    @Test func targetInFrontButNotedHoldsKeyboardStillGetsHandOver() {
+        #expect(FocusReturn.activationPlan(targetPID: 20, frontPID: 20, myPID: 10, notedHoldsKeyboard: true) == .bringForward)
+    }
+
+    @Test func ownProcessIsIgnoredEvenWhenHoldingKeyboard() {
+        #expect(FocusReturn.activationPlan(targetPID: 10, frontPID: 10, myPID: 10, notedHoldsKeyboard: true) == .ignore)
+    }
 }

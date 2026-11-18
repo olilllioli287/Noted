@@ -2153,6 +2153,7 @@ final class AudioEngine {
     private func handleBTDeviceSampleRateChanged(uid: String, newRate: Double) async {
         logger.info("[RATE] BT output \(uid, privacy: .public) → \(newRate, format: .fixed(precision: 0)) Hz — recreating affected taps (clean dip)")
         let affected = taps.filter { $0.value.currentDeviceUIDs.contains(uid) }
+        logger.notice("[DIAG] \(ISO8601DateFormatter().string(from: Date()), privacy: .public) 取樣率變化事件：\(uid, privacy: .public) → \(Int(newRate)) Hz，受影響的 tap \(affected.count) 個")
         for (pid, tap) in affected {
             do {
                 logger.info("[RATE] Recreating tap for PID \(pid)")

@@ -201,6 +201,7 @@ final class GrabView: NSView, NSDraggingSource {
         // Released where nothing accepts it: it flies back to the line.
         session.animatesToStartingPositionsOnCancelOrFail = true
         GrabView.isDragging = true
+        InputFocus.cancelPending()   // 下一次拖曳開始：上一輪的游標還原不再做
         onDragStart()
     }
 

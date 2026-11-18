@@ -122,6 +122,35 @@ enum PolicyMuteRule {
     }
 }
 
+enum SettleMuteAction: Equatable {
+    case recordUserMuteAndSetFlag
+    case recordUserMute
+    case enforce
+    case ignore
+}
+
+enum SettleMuteRule {
+    static func decide(
+        armed: Bool,
+        selected: Bool,
+        isBluetooth: Bool,
+        settling: Bool,
+        flagSet: Bool,
+        muted: Bool,
+        recordedMute: Bool
+    ) -> SettleMuteAction {
+        // 判斷順序不能換（見規格第 4 節）：沒勾選與非藍牙都要先於「回報值相同就忽略」，
+        // 否則沒勾選的裝置被別人解除靜音時（回報值剛好等於預設的 false）會漏掉重新靜音。
+        guard armed else { return .ignore }
+        guard selected else { return .enforce }
+        guard isBluetooth else { return settling ? .enforce : .recordUserMute }
+        guard settling else { return .recordUserMute }
+        if muted == recordedMute { return .ignore }
+        if flagSet { return .recordUserMute }
+        return muted ? .recordUserMuteAndSetFlag : .enforce
+    }
+}
+
 /// 決定「跟隨預設」tap 的路由與策略靜音狀態。
 enum FollowPlanner {
     static func plan(armed: Bool, targets: [String], defaultUID: String?) -> (devices: [String], policyMuted: Bool) {
@@ -276,6 +305,11 @@ final class OutputPolicy {
     /// 剛連上的裝置：這段時間內音量被別人改掉會再蓋回去，也不會當成使用者的操作記下來。
     @ObservationIgnored private var settleUntil: [String: Date] = [:]
     @ObservationIgnored private var settleRewrites: [String: Int] = [:]
+    /// 時鐘，測試用來把時間往後撥，不必真的等穩定期過完。
+    @ObservationIgnored var now: () -> Date = { Date() }
+    @ObservationIgnored private var settleMuteUIDs: Set<String> = []
+    @ObservationIgnored private var settleMuteFlags: Set<String> = []
+    private let transportResolver: (AudioDeviceID) -> TransportType
     /// 策略自己正在寫裝置（可能巢狀），這段時間的回呼不是使用者的操作
     @ObservationIgnored private var writeDepth = 0
     private var isWriting: Bool { writeDepth > 0 }
@@ -287,10 +321,16 @@ final class OutputPolicy {
     static let bluetoothSettleSeconds: TimeInterval = 5
     static let maxSettleRewrites = 6
 
-    init(settingsManager: SettingsManager, deviceMonitor: any AudioDeviceProviding, volumeMonitor: any DeviceVolumeProviding) {
+    init(
+        settingsManager: SettingsManager,
+        deviceMonitor: any AudioDeviceProviding,
+        volumeMonitor: any DeviceVolumeProviding,
+        transportResolver: @escaping (AudioDeviceID) -> TransportType = { $0.readTransportType() }
+    ) {
         self.settingsManager = settingsManager
         self.deviceMonitor = deviceMonitor
         self.volumeMonitor = volumeMonitor
+        self.transportResolver = transportResolver
         self.state = settingsManager.outputPolicyState
         self.volumeMutedDevices = []
         self.volumeMutedDevices = Set(settingsManager.outputPolicyState.volumeMuted)
@@ -461,9 +501,15 @@ final class OutputPolicy {
     // MARK: 事件（AudioEngine 轉進來）
 
     func deviceConnected(_ uid: String) {
-        let transport = deviceMonitor.device(for: uid)?.id.readTransportType()
+        settleMuteFlags.remove(uid)
+        let transport = deviceMonitor.device(for: uid).map { transportResolver($0.id) }
+        if transport == .bluetooth || transport == .bluetoothLE {
+            settleMuteUIDs.insert(uid)
+        } else {
+            settleMuteUIDs.remove(uid)
+        }
         let seconds = (transport == .bluetooth || transport == .bluetoothLE) ? Self.bluetoothSettleSeconds : Self.settleSeconds
-        settleUntil[uid] = Date().addingTimeInterval(seconds)
+        settleUntil[uid] = now().addingTimeInterval(seconds)
         settleRewrites[uid] = 0
         enforce()
         onTargetsChanged?()
@@ -471,6 +517,8 @@ final class OutputPolicy {
 
     func deviceDisconnected(_ uid: String) {
         unmutableDevices.remove(uid)
+        settleMuteUIDs.remove(uid)
+        settleMuteFlags.remove(uid)
         settleUntil[uid] = nil
         enforce()
         onTargetsChanged?()
@@ -500,13 +548,32 @@ final class OutputPolicy {
     func externalMuteChanged(_ deviceID: AudioDeviceID, _ muted: Bool) {
         guard state.armed, !isWriting,
               let uid = deviceMonitor.outputDevices.first(where: { $0.id == deviceID })?.uid else { return }
-        if state.selected.contains(uid), !isSettling(uid) {
+        let settling = isSettling(uid)
+        let action = SettleMuteRule.decide(
+            armed: state.armed,
+            selected: state.selected.contains(uid),
+            isBluetooth: settleMuteUIDs.contains(uid),
+            settling: settling,
+            flagSet: settleMuteFlags.contains(uid),
+            muted: muted,
+            recordedMute: state.userMutes[uid] ?? false
+        )
+        switch action {
+        case .recordUserMuteAndSetFlag:
             var next = state
             next.userMutes[uid] = muted
             state = next
-        } else {
-            // 沒勾選的被別人解除靜音，或剛連上的裝置：蓋回去
+            settleMuteFlags.insert(uid)
+            let elapsed = Self.bluetoothSettleSeconds - (settleUntil[uid].map { $0.timeIntervalSince(now()) } ?? 0)
+            logger.info("Accepted Bluetooth mute during settling for uid=\(uid, privacy: .public), reconnect=\(elapsed, privacy: .public)s")
+        case .recordUserMute:
+            var next = state
+            next.userMutes[uid] = muted
+            state = next
+        case .enforce:
             enforce()
+        case .ignore:
+            break
         }
     }
 
@@ -516,7 +583,11 @@ final class OutputPolicy {
         var next = state
         if let volume = volumeMonitor.volumes[deviceID] { next.volumes[uid] = volume }
         if state.armed, state.selected.contains(uid) {
-            next.userMutes[uid] = volumeMonitor.muteStates[deviceID] ?? false
+            let muted = volumeMonitor.muteStates[deviceID] ?? false
+            next.userMutes[uid] = muted
+            if settleMuteUIDs.contains(uid), isSettling(uid), muted != (state.userMutes[uid] ?? false) {
+                settleMuteFlags.insert(uid)
+            }
         }
         state = next
         // 沒勾選的裝置被解除靜音的話，蓋回去
@@ -525,7 +596,7 @@ final class OutputPolicy {
 
     private func isSettling(_ uid: String) -> Bool {
         guard let until = settleUntil[uid] else { return false }
-        if Date() < until { return true }
+        if now() < until { return true }
         settleUntil[uid] = nil
         return false
     }

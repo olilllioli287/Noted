@@ -117,6 +117,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: parts[1]))
                     }
                 }
+            case "flight-snap":   // flight-snap <輸出檔.png>：把正在飛的截圖畫面存成圖
+                if parts.count > 1 { _ = ShotLineModule.debugFlightSnapshot(parts[1]) }
+            case "flight-auto":   // flight-auto <前綴>：下一次飛行在 10/30/50/70/90% 處各存一張圖
+                if parts.count > 1 { ShotLineModule.debugFlightAuto(parts[1]) }
+            case "flight-state":   // flight-state <輸出檔>：寫出飛行中數量與殘留的飛行視窗數
+                if parts.count > 1 { try? (ShotLineModule.debugFlightState + "\n" + ShotLineModule.debugFlightDetail()).write(toFile: parts[1], atomically: true, encoding: .utf8) }
+            case "mouse-at":   // mouse-at <x> <y>｜mouse-at off：假裝滑鼠在螢幕座標 (x, y)，並走一次滑鼠移動（測離開收起用）
+                if parts.count > 2, let x = Double(parts[1]), let y = Double(parts[2]) { c?.debugMouse(NSPoint(x: x, y: y)) }
+                else if parts.count > 1 { c?.debugMouse(nil) }
+            case "shot-state":   // shot-state <輸出檔>：寫出截圖模組現在的狀態（running｜standby｜off）
+                if parts.count > 1 { try? "\(ShotLineModule.shared.state)".write(toFile: parts[1], atomically: true, encoding: .utf8) }
             case "shot-act": if parts.count > 1 { SuiteHost.debugShot(parts[1]) }   // sent｜discard｜keep，只在截圖測試模式有作用
             case "theme": if parts.count > 1, let t = PanelTheme.all.first(where: { $0.id == parts[1] }) { Prefs.shared.apply(t) }
             case "ratio": if parts.count > 2, let w = Double(parts[1]), let h = Double(parts[2]) { SuitePrefs.shared.widthRatio = w; SuitePrefs.shared.heightRatio = h; self.controllers.forEach { $0.refreshGeometry() } }
@@ -147,8 +158,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                         + self.controllers.map { "ignoresMouse=\($0.window.ignoresMouseEvents) state=\($0.model.state)" }.joined(separator: "\n")
                     try? text.write(toFile: parts[1], atomically: true, encoding: .utf8)
                 }
+            case "hit":   // hit <輸出檔> strip｜card：提示狀態下，瀏海那條／下面卡片上的點會被哪個 view 接到（測試用）
+                if parts.count > 2, let c, let cv = c.window.contentView {
+                    let r = c.model.shapeRect
+                    let sp = parts[2] == "strip" ? NSPoint(x: r.midX, y: c.shotNotchStrip.midY) : NSPoint(x: r.midX, y: r.minY + 30)
+                    let wf = c.model.windowFrame
+                    let wp = NSPoint(x: sp.x - wf.minX, y: sp.y - wf.minY)
+                    let top = cv.superview ?? cv
+                    let hit = top.hitTest(top.convert(wp, from: nil))
+                    try? "state=\(c.model.state) \(parts[2]) -> \(hit.map { String(describing: type(of: $0)) } ?? "nil")".write(toFile: parts[1], atomically: true, encoding: .utf8)
+                }
+            case "rebuild-force":   // rebuild-force <輸出檔>：不管螢幕有沒有變都重建，回報舊控制器重建後的狀態（測試用）
+                if parts.count > 1 {
+                    let old = self.controllers
+                    self.rebuildControllers()
+                    try? "oldStates=\(old.map { "\($0.model.state)" }) newStates=\(self.controllers.map { "\($0.model.state)" })".write(toFile: parts[1], atomically: true, encoding: .utf8)
+                }
+            case "rebuild-check":   // rebuild-check <輸出檔>：照螢幕參數通知的路徑，螢幕沒變應該跳過、控制器原封不動（測試用）
+                if parts.count > 1 {
+                    let before = self.controllers.map { ObjectIdentifier($0) }
+                    let rebuilt = self.rebuildIfScreensChanged()
+                    let same = before == self.controllers.map { ObjectIdentifier($0) }
+                    try? "rebuilt=\(rebuilt) sameControllers=\(same) states=\(self.controllers.map { "\($0.model.state)" })".write(toFile: parts[1], atomically: true, encoding: .utf8)
+                }
             case "dump":
-                let info = self.controllers.map { "\($0.screen.localizedName) notch=\($0.model.hasNotch) shape=\($0.model.shapeRect) win=\($0.window.frame) state=\($0.model.state)" }
+                let info = self.controllers.map { "\($0.screen.localizedName) notch=\($0.model.hasNotch) shape=\($0.model.shapeRect) win=\($0.window.frame) state=\($0.model.state) shotCount=\($0.model.shotCount)" }
                 try? info.joined(separator: "\n").write(toFile: NSTemporaryDirectory() + "noted-dump.txt", atomically: true, encoding: .utf8)
             default: break
             }
@@ -188,13 +222,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func scheduleRebuild() {
         rebuildWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in self?.rebuildControllers() }
+        let w = DispatchWorkItem { [weak self] in self?.rebuildIfScreensChanged() }
         rebuildWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: w)
     }
 
+    /// 螢幕清單（編號、位置大小、瀏海安全區）的指紋；螢幕參數通知很常在沒變的時候也來（例如色彩描述檔、Dock 變動）。
+    private var screenSignature: String {
+        NSScreen.screens.map { "\(NotchController.key(for: $0))|\($0.frame)|\($0.safeAreaInsets.top)" }.joined(separator: ";")
+    }
+    private var lastScreenSignature = ""
+
+    /// 螢幕參數變了才重建；實際沒變就不動（不然展開中的面板會被收掉）。回傳有沒有重建。
+    @discardableResult
+    func rebuildIfScreensChanged() -> Bool {
+        guard screenSignature != lastScreenSignature else { return false }
+        rebuildControllers()
+        return true
+    }
+
     func rebuildControllers() {
+        // 展開中的面板先正常收起（還焦點、關音量完整面板、存筆記），不要直接拆掉
+        controllers.forEach { $0.collapse() }
         controllers.forEach { $0.teardown() }
+        lastScreenSignature = screenSignature
         let off = Set(Prefs.shared.disabledDisplays)
         controllers = NSScreen.screens.filter { !off.contains(NotchController.key(for: $0)) }.map { NotchController(screen: $0) }
     }
